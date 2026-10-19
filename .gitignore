@@ -5,3 +5,6 @@
 
 # Ignoring the build folder 
 firmware/water_treatment/build/
+
+# Ignoring backups 
+Simulation/Project Backups/
