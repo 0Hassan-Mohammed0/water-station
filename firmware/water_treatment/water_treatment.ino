@@ -16,11 +16,6 @@
 //
 //  ALL SETTINGS (setpoint, PID gains, auto steps...) are in the
 //  "USER SETTINGS" block below - edit them here and re-upload.
-//
-//  Oscilloscope outputs (PWM -> RC filter -> scope):
-//    D3  = measured flow     (0..5 V  =  0..SCOPE_FULL_SCALE_LPM)
-//    D11 = flow setpoint     (same scale)
-//    D5  = pump-2 drive      (copy of the pump-2 PWM, 0..5 V = 0..255)
 // =====================================================================
 
 // ================= USER SETTINGS (edit here) =================
@@ -53,13 +48,8 @@ const int ECHO_PIN     = A5;
 
 const int FLOW_PIN     = 2;
 
-// Oscilloscope outputs (PWM pins on Timer2, not touched by Servo)
-const int SCOPE_FLOW_PIN = 3;
-const int SCOPE_SP_PIN   = 11;
-const int SCOPE_PUMP_PIN = 5;     // PWM copy of pump-2 drive (free PWM pin)
-
 // Pump 1 - L298 (fills the tank)
-const int PUMP1_EN     = 4;       // plain ON/OFF now (was D5 PWM)
+const int PUMP1_EN     = 4;       // plain ON/OFF
 const int PUMP1_IN1    = 7;
 const int PUMP1_IN2    = 8;
 
@@ -152,9 +142,6 @@ const unsigned long FLOW_WINDOW_SIM_MS     = 100;
 const unsigned long FLOW_WINDOW_PROTEUS_MS = 250;
 const float FLOW_ALPHA_SIM     = 0.6;
 const float FLOW_ALPHA_PROTEUS = 0.5;
-
-// Oscilloscope scale: 5 V = this many L/min
-const float SCOPE_FULL_SCALE_LPM = 50.0;
 
 volatile unsigned long pulseCount = 0;
 
@@ -516,16 +503,6 @@ void updateAutoSetpoint() {
   }
 }
 
-// ================= OSCILLOSCOPE OUTPUTS =================
-void updateScope() {
-  float f = constrain(flowLpm / SCOPE_FULL_SCALE_LPM, 0.0, 1.0);
-  float s = systemRunning ? constrain(setpoint / SCOPE_FULL_SCALE_LPM, 0.0, 1.0) : 0.0;
-
-  analogWrite(SCOPE_FLOW_PIN, (int)(f * 255.0));
-  analogWrite(SCOPE_SP_PIN,   (int)(s * 255.0));
-  analogWrite(SCOPE_PUMP_PIN, pump2Running ? pump2Pwm : 0);
-}
-
 // ================= STATE CHANGE MESSAGES =================
 void printStateChange(bool qualityAlarm, bool overflow) {
   static int lastKey = -1;
@@ -605,10 +582,6 @@ void setup() {
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   digitalWrite(TRIG_PIN, LOW);
-
-  pinMode(SCOPE_FLOW_PIN, OUTPUT);
-  pinMode(SCOPE_SP_PIN, OUTPUT);
-  pinMode(SCOPE_PUMP_PIN, OUTPUT);
 
   pinMode(FLOW_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(FLOW_PIN), pulseISR, RISING);
@@ -791,9 +764,6 @@ void loop() {
     setValve(VALVE_CLOSED);
     flowTimerStarted = false;
   }
-
-  // ---------- SCOPE OUTPUTS ----------
-  updateScope();
 
   // ---------- TERMINAL ----------
   printStateChange(qualityAlarm, overflow);
