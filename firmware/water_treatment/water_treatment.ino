@@ -471,7 +471,7 @@ void loop() {
     }
 
     // Outlet valve
-    if (waterQualityGood && !overflow) {
+    if (pump2Allowed) {
       valveServo.write(VALVE_OPEN);
     } else {
       valveServo.write(VALVE_CLOSED);
@@ -540,8 +540,7 @@ void loop() {
 
     lcd.print(" V:");
     lcd.print(
-      systemRunning && waterQualityGood && !overflow
-        ? VALVE_OPEN : VALVE_CLOSED
+      pump2Running ? VALVE_OPEN : VALVE_CLOSED
     );
 
     lcd.print("  ");
