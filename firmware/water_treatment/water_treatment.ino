@@ -3,9 +3,10 @@
 #include <Servo.h>
 
 // ================= SIMULATION MODE =================
-// 1 = tank level and flow are simulated in software (for Proteus)
-// 0 = real HC-SR04 and real flow sensor are used (for hardware)
-#define SIMULATE_TANK 1
+// 1 = tank LEVEL is simulated in software (for Proteus)
+// 0 = real HC-SR04 is used (for hardware)
+// FLOW is always measured from the flow sensor pulses on D2 (Proteus model or real).
+#define SIMULATE_LEVEL 1
 
 // ================= LCD =================
 LiquidCrystal lcd(12, 11, A3, 3, 4, 13);
@@ -19,22 +20,25 @@ const int ECHO_PIN     = A5;
 
 const int FLOW_PIN     = 2;
 
-// Pump 1 - L298
+// Pump 1 - L298 (fills the tank)
 const int PUMP1_EN     = 5;
 const int PUMP1_IN1    = 7;
 const int PUMP1_IN2    = 8;
 
-// Pump 2 - L298
+// Pump 2 - L298 (empties the tank)
 const int PUMP2_EN     = 6;
 const int PUMP2_IN3    = 10;
 const int PUMP2_IN4    = A4;
 
-// Servo valve
+// Servo = 3-way diverter valve
 const int SERVO_PIN    = 9;
 
-// Start/Stop buttons (active LOW)
-const int START_PIN    = 0;
-const int STOP_PIN     = 1;
+// Single ON/OFF switch (level based)
+// 1 (HIGH) = system ON, 0 (LOW) = system OFF.
+// Wired with a pull-up, so open/driven-high = ON and tied to ground = OFF.
+// If you prefer "switch closed to ground = ON", change SWITCH_ON_LEVEL to LOW.
+const int SWITCH_PIN   = 0;
+const int SWITCH_ON_LEVEL = LOW;
 
 // ================= SETTINGS =================
 const float PH_MIN = 6.5;
@@ -61,16 +65,21 @@ const float TANK_HEIGHT_CM = 400.0;
 const float MIN_FLOW = 10.0;
 const int PUMP2_SPEED = 180;
 
-const int VALVE_OPEN   = 90;
-const int VALVE_CLOSED = 0;
+// Diverter valve positions
+const int VALVE_CLOSED = 0;     // nothing leaves the tank
+const int VALVE_OPEN   = 90;    // route to treated-water output
+const int VALVE_WASTE  = 180;   // route to waste / drain
+
+// ================= BAD WATER FLUSH SETTINGS =================
+const unsigned long BAD_WATER_DELAY_MS = 3000;  // water must stay bad this long
+const int  FLUSH_END_LEVEL = 10;                // flush until level <= this (%)
+const int  MAX_FLUSHES     = 3;                 // flushes in a row before "source bad" alarm
 
 // ================= TANK SIMULATION SETTINGS =================
-#if SIMULATE_TANK
+#if SIMULATE_LEVEL
 float simLevel = 20.0;                    // starting level (%)
 const float SIM_FILL_PER_S  = 4.0;        // % per second while Pump 1 runs
-const float SIM_DRAIN_PER_S = 2.0;        // % per second while Pump 2 runs
-const float SIM_FLOW_LPM    = 12.0;       // flow shown while Pump 2 runs
-                                          // (set below MIN_FLOW to test the alarm)
+const float SIM_TANK_CAPACITY_L = 10.0;   // virtual tank volume (L); drain rate follows the MEASURED flow
 unsigned long lastSimMillis = 0;
 #endif
 
@@ -101,8 +110,16 @@ bool flowAlarmLatched = false;
 
 unsigned long lowFlowStart = 0;
 
-bool previousStart = HIGH;
-bool previousStop = HIGH;
+// Bad-water handling
+bool flushing = false;
+bool sourceAlarm = false;
+bool badTimerStarted = false;
+unsigned long badStart = 0;
+int flushCount = 0;
+
+int valveAngle = VALVE_CLOSED;
+
+bool previousSwitchOn = false;
 
 unsigned long lastButtonCheck = 0;
 unsigned long lastLcdUpdate = 0;
@@ -188,14 +205,15 @@ float readDistanceCm() {
 }
 
 // ================= TANK SIMULATION =================
-#if SIMULATE_TANK
+#if SIMULATE_LEVEL
 void updateSimTank() {
   unsigned long now = millis();
   float dt = (now - lastSimMillis) / 1000.0;
   lastSimMillis = now;
 
   if (pump1Running) simLevel += SIM_FILL_PER_S * dt;
-  if (pump2Running) simLevel -= SIM_DRAIN_PER_S * dt;
+  // Drain = measured flow (L/min) -> L/s, times dt, as % of tank capacity
+  if (pump2Running) simLevel -= (flowLpm / 60.0) * dt / SIM_TANK_CAPACITY_L * 100.0;
 
   simLevel = constrain(simLevel, 0.0, 100.0);
 }
@@ -203,7 +221,7 @@ void updateSimTank() {
 
 // ================= UPDATE WATER LEVEL =================
 int readLevel() {
-#if SIMULATE_TANK
+#if SIMULATE_LEVEL
 
   levelSensorValid = true;
   return (int)(simLevel + 0.5);
@@ -246,27 +264,27 @@ int readLevel() {
 
 // ================= UPDATE FLOW =================
 void updateFlow() {
-#if SIMULATE_TANK
-
-  flowLpm = pump2Running ? SIM_FLOW_LPM : 0.0;
-
-#else
-
   unsigned long now = millis();
+  unsigned long elapsed = now - lastFlowMillis;
 
-  if (now - lastFlowMillis >= 1000) {
+  if (elapsed >= 1000) {
 
     noInterrupts();
     unsigned long count = pulseCount;
     pulseCount = 0;
     interrupts();
 
-    flowLpm = (count * 60.0) / PULSES_PER_LITRE;
+    // pulses -> litres -> per minute, using the REAL window length
+    flowLpm = (count * 60000.0) / (PULSES_PER_LITRE * elapsed);
 
     lastFlowMillis = now;
   }
+}
 
-#endif
+// ================= VALVE CONTROL =================
+void setValve(int angle) {
+  valveAngle = angle;
+  valveServo.write(angle);
 }
 
 // ================= PUMP CONTROL =================
@@ -302,6 +320,17 @@ void startPump2() {
   pump2Running = true;
 }
 
+// ================= RESET ALARMS / FLUSH STATE =================
+void resetStates() {
+  flowTimerStarted = false;
+  flowAlarmLatched = false;
+
+  flushing = false;
+  sourceAlarm = false;
+  badTimerStarted = false;
+  flushCount = 0;
+}
+
 // ================= STOP SYSTEM =================
 void stopSystem() {
   systemRunning = false;
@@ -309,10 +338,9 @@ void stopSystem() {
   stopPump1();
   stopPump2();
 
-  valveServo.write(VALVE_CLOSED);
+  setValve(VALVE_CLOSED);
 
-  flowTimerStarted = false;
-  flowAlarmLatched = false;
+  resetStates();
 }
 
 // ================= SETUP =================
@@ -337,8 +365,7 @@ void setup() {
     RISING
   );
 
-  pinMode(START_PIN, INPUT_PULLUP);
-  pinMode(STOP_PIN, INPUT_PULLUP);
+  pinMode(SWITCH_PIN, INPUT_PULLUP);
 
   valveServo.attach(SERVO_PIN);
 
@@ -354,14 +381,17 @@ void setup() {
   stopPump1();
   stopPump2();
 
-  valveServo.write(VALVE_CLOSED);
+  setValve(VALVE_CLOSED);
 
   delay(1000);
   lcd.clear();
 
   lastFlowMillis = millis();
+  noInterrupts();
+  pulseCount = 0;          // drop pulses counted during startup
+  interrupts();
 
-#if SIMULATE_TANK
+#if SIMULATE_LEVEL
   lastSimMillis = millis();
 #endif
 }
@@ -369,29 +399,28 @@ void setup() {
 // ================= MAIN LOOP =================
 void loop() {
 
-  // ---------- START / STOP BUTTONS ----------
-  bool startState = digitalRead(START_PIN);
-  bool stopState  = digitalRead(STOP_PIN);
-
+  // ---------- ON / OFF SWITCH ----------
   if (millis() - lastButtonCheck >= 30) {
     lastButtonCheck = millis();
 
-    if (previousStart == HIGH && startState == LOW) {
+    bool switchOn = (digitalRead(SWITCH_PIN) == SWITCH_ON_LEVEL);
+
+    if (switchOn && !previousSwitchOn) {
+      // OFF -> ON: start the system and clear any latched alarms
       systemRunning = true;
-      flowTimerStarted = false;
-      flowAlarmLatched = false;
+      resetStates();
     }
 
-    if (previousStop == HIGH && stopState == LOW) {
+    if (!switchOn && previousSwitchOn) {
+      // ON -> OFF: stop everything
       stopSystem();
     }
 
-    previousStart = startState;
-    previousStop = stopState;
+    previousSwitchOn = switchOn;
   }
 
   // ---------- SIMULATED TANK UPDATE ----------
-#if SIMULATE_TANK
+#if SIMULATE_LEVEL
   updateSimTank();
 #endif
 
@@ -420,7 +449,43 @@ void loop() {
   // ---------- SYSTEM CONTROL ----------
   if (systemRunning) {
 
-    // Pump 1: fill tank using level hysteresis
+    // ----- Bad water detection (debounced) -----
+    if (!waterQualityGood && !flushing && !sourceAlarm) {
+
+      if (!badTimerStarted) {
+        badStart = millis();
+        badTimerStarted = true;
+      }
+
+      if (millis() - badStart >= BAD_WATER_DELAY_MS &&
+          level > FLUSH_END_LEVEL) {
+
+        badTimerStarted = false;
+
+        if (flushCount >= MAX_FLUSHES) {
+          // Fresh water keeps coming in bad: stop and alarm
+          sourceAlarm = true;
+        } else {
+          flushing = true;
+          flushCount++;
+        }
+      }
+
+    } else {
+      badTimerStarted = false;
+    }
+
+    // ----- End of flush -----
+    if (flushing && level <= FLUSH_END_LEVEL) {
+      flushing = false;
+    }
+
+    // ----- Tank full of good water: forget previous flushes -----
+    if (waterQualityGood && level >= LEVEL_STOP_PUMP1) {
+      flushCount = 0;
+    }
+
+    // ----- Pump 1: fill tank using level hysteresis -----
     if (level <= LEVEL_START_PUMP1) {
       pump1Running = true;
     }
@@ -428,7 +493,8 @@ void loop() {
       pump1Running = false;
     }
 
-    if (overflow) {
+    // No filling while flushing, on source alarm, or on overflow
+    if (overflow || flushing || sourceAlarm) {
       pump1Running = false;
     }
 
@@ -438,12 +504,22 @@ void loop() {
       stopPump1();
     }
 
-    // Pump 2: transfer water only when quality is acceptable
-    bool pump2Allowed =
-      waterQualityGood &&
-      !overflow &&
-      level > LEVEL_MIN_PUMP2 &&
-      !flowAlarmLatched;
+    // ----- Pump 2: output good water OR flush bad water -----
+    bool pump2Allowed;
+
+    if (sourceAlarm) {
+      pump2Allowed = false;
+    }
+    else if (flushing) {
+      pump2Allowed = !flowAlarmLatched;
+    }
+    else {
+      pump2Allowed =
+        waterQualityGood &&
+        !overflow &&
+        level > LEVEL_MIN_PUMP2 &&
+        !flowAlarmLatched;
+    }
 
     if (pump2Allowed) {
       startPump2();
@@ -459,6 +535,7 @@ void loop() {
           flowAlarmLatched = true;
           flowTimerStarted = false;
           stopPump2();
+          pump2Allowed = false;
         }
 
       } else {
@@ -470,11 +547,15 @@ void loop() {
       flowTimerStarted = false;
     }
 
-    // Outlet valve
-    if (pump2Allowed) {
-      valveServo.write(VALVE_OPEN);
-    } else {
-      valveServo.write(VALVE_CLOSED);
+    // ----- Diverter valve -----
+    if (!pump2Allowed) {
+      setValve(VALVE_CLOSED);
+    }
+    else if (flushing) {
+      setValve(VALVE_WASTE);
+    }
+    else {
+      setValve(VALVE_OPEN);
     }
 
   } else {
@@ -482,7 +563,7 @@ void loop() {
     stopPump1();
     stopPump2();
 
-    valveServo.write(VALVE_CLOSED);
+    setValve(VALVE_CLOSED);
 
     flowTimerStarted = false;
   }
@@ -492,12 +573,18 @@ void loop() {
     lastLcdUpdate = millis();
 
     bool alarm =
-      qualityAlarm || overflow || flowAlarmLatched;
+      qualityAlarm || overflow || flowAlarmLatched || sourceAlarm;
 
     lcd.setCursor(0, 0);
 
     if (!systemRunning) {
       lcd.print("STOPPED             ");
+    }
+    else if (sourceAlarm) {
+      lcd.print("ALARM: SOURCE BAD   ");
+    }
+    else if (flushing) {
+      lcd.print("FLUSHING BAD WATER  ");
     }
     else if (alarm) {
       lcd.print("RUNNING - ALARM     ");
@@ -529,7 +616,7 @@ void loop() {
     lcd.print(flow, 1);
     lcd.print("L/m ");
 
-    // Row 3: pump and valve status
+    // Row 3: pumps and valve (OUT = treated output, WST = waste)
     lcd.setCursor(0, 3);
 
     lcd.print("P1:");
@@ -539,10 +626,14 @@ void loop() {
     lcd.print(pump2Running ? "ON " : "OFF");
 
     lcd.print(" V:");
-    lcd.print(
-      pump2Running ? VALVE_OPEN : VALVE_CLOSED
-    );
+    if (valveAngle == VALVE_OPEN) {
+      lcd.print("OUT");
+    } else if (valveAngle == VALVE_WASTE) {
+      lcd.print("WST");
+    } else {
+      lcd.print("OFF");
+    }
 
-    lcd.print("  ");
+    lcd.print(" ");
   }
 }
