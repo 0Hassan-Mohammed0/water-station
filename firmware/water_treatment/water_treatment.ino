@@ -1,7 +1,11 @@
-
 #include <Arduino.h>
 #include <LiquidCrystal.h>
 #include <Servo.h>
+
+// ================= SIMULATION MODE =================
+// 1 = tank level and flow are simulated in software (for Proteus)
+// 0 = real HC-SR04 and real flow sensor are used (for hardware)
+#define SIMULATE_TANK 1
 
 // ================= LCD =================
 LiquidCrystal lcd(12, 11, A3, 3, 4, 13);
@@ -60,6 +64,16 @@ const int PUMP2_SPEED = 180;
 const int VALVE_OPEN   = 90;
 const int VALVE_CLOSED = 0;
 
+// ================= TANK SIMULATION SETTINGS =================
+#if SIMULATE_TANK
+float simLevel = 20.0;                    // starting level (%)
+const float SIM_FILL_PER_S  = 4.0;        // % per second while Pump 1 runs
+const float SIM_DRAIN_PER_S = 2.0;        // % per second while Pump 2 runs
+const float SIM_FLOW_LPM    = 12.0;       // flow shown while Pump 2 runs
+                                          // (set below MIN_FLOW to test the alarm)
+unsigned long lastSimMillis = 0;
+#endif
+
 // ================= FLOW SENSOR =================
 const float PULSES_PER_LITRE = 450.0;
 
@@ -80,6 +94,7 @@ Servo valveServo;
 // ================= SYSTEM STATE =================
 bool systemRunning = false;
 bool pump1Running = false;
+bool pump2Running = false;
 
 bool flowTimerStarted = false;
 bool flowAlarmLatched = false;
@@ -126,7 +141,6 @@ float readPH() {
 float readTurbidityNTU() {
   long sum = 0;
 
-  // Average multiple analog readings
   for (int i = 0; i < TURB_SAMPLES; i++) {
     sum += analogRead(TURB_PIN);
     delay(5);
@@ -141,10 +155,8 @@ float readTurbidityNTU() {
   // 4 V = 0 NTU, 1 V = 4000 NTU
   float rawNTU = (4.0 - voltage) * (4000.0 / 3.0);
 
-  // Limit estimated value to the assumed model range
   rawNTU = constrain(rawNTU, 0.0, 4000.0);
 
-  // Smooth the output
   if (smoothedNTU < 0.0) {
     smoothedNTU = rawNTU;
   } else {
@@ -175,8 +187,29 @@ float readDistanceCm() {
   return duration * 0.0343 / 2.0;
 }
 
+// ================= TANK SIMULATION =================
+#if SIMULATE_TANK
+void updateSimTank() {
+  unsigned long now = millis();
+  float dt = (now - lastSimMillis) / 1000.0;
+  lastSimMillis = now;
+
+  if (pump1Running) simLevel += SIM_FILL_PER_S * dt;
+  if (pump2Running) simLevel -= SIM_DRAIN_PER_S * dt;
+
+  simLevel = constrain(simLevel, 0.0, 100.0);
+}
+#endif
+
 // ================= UPDATE WATER LEVEL =================
 int readLevel() {
+#if SIMULATE_TANK
+
+  levelSensorValid = true;
+  return (int)(simLevel + 0.5);
+
+#else
+
   unsigned long now = millis();
 
   if (now - lastLevelMillis >= 200 ||
@@ -207,10 +240,18 @@ int readLevel() {
       TANK_HEIGHT_CM) * 100.0;
 
   return constrain((int)(percentage + 0.5), 0, 100);
+
+#endif
 }
 
 // ================= UPDATE FLOW =================
 void updateFlow() {
+#if SIMULATE_TANK
+
+  flowLpm = pump2Running ? SIM_FLOW_LPM : 0.0;
+
+#else
+
   unsigned long now = millis();
 
   if (now - lastFlowMillis >= 1000) {
@@ -224,6 +265,8 @@ void updateFlow() {
 
     lastFlowMillis = now;
   }
+
+#endif
 }
 
 // ================= PUMP CONTROL =================
@@ -247,12 +290,16 @@ void stopPump2() {
   analogWrite(PUMP2_EN, 0);
   digitalWrite(PUMP2_IN3, LOW);
   digitalWrite(PUMP2_IN4, LOW);
+
+  pump2Running = false;
 }
 
 void startPump2() {
   digitalWrite(PUMP2_IN3, HIGH);
   digitalWrite(PUMP2_IN4, LOW);
   analogWrite(PUMP2_EN, PUMP2_SPEED);
+
+  pump2Running = true;
 }
 
 // ================= STOP SYSTEM =================
@@ -313,6 +360,10 @@ void setup() {
   lcd.clear();
 
   lastFlowMillis = millis();
+
+#if SIMULATE_TANK
+  lastSimMillis = millis();
+#endif
 }
 
 // ================= MAIN LOOP =================
@@ -338,6 +389,11 @@ void loop() {
     previousStart = startState;
     previousStop = stopState;
   }
+
+  // ---------- SIMULATED TANK UPDATE ----------
+#if SIMULATE_TANK
+  updateSimTank();
+#endif
 
   // ---------- READ SENSORS ----------
   float ph = readPH();
@@ -480,14 +536,7 @@ void loop() {
     lcd.print(pump1Running ? "ON " : "OFF");
 
     lcd.print(" P2:");
-    lcd.print(
-      systemRunning &&
-      waterQualityGood &&
-      !overflow &&
-      level > LEVEL_MIN_PUMP2 &&
-      !flowAlarmLatched
-        ? "ON " : "OFF"
-    );
+    lcd.print(pump2Running ? "ON " : "OFF");
 
     lcd.print(" V:");
     lcd.print(
