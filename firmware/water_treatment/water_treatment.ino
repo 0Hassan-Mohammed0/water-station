@@ -2,54 +2,32 @@
 #include <Servo.h>
 
 // =====================================================================
-//  WATER TREATMENT STATION  -  PID flow control + Virtual Terminal
+//  WATER STATION  -  PID flow control + Virtual Terminal (output only)
 //
 //  Terminal (9600 baud, 8N1):  Arduino TX(D1) -> Terminal RXD
-//                              Arduino RX(D0) <- Terminal TXD
 //
-//  MODES (press 1 or 2 in the terminal; no other terminal commands):
-//    1 = SIMULATION : tank level AND flow are both simulated in software
-//                     (flow setpoint changes automatically in steps)
-//    2 = PROTEUS    : tank level is read from the HC-SR04 (D A2/A5) and
-//                     flow from the flow-sensor pulses on D2; you change
-//                     both by hand inside Proteus
-//
-//  ALL SETTINGS (setpoint, PID gains, auto steps...) are in the
-//  "USER SETTINGS" block below - edit them here and re-upload.
+//  Level : HC-SR04 (adjust distance in Proteus)
+//  Flow  : flow-sensor pulses on D2 (adjust flow in Proteus)
+//  Pump 2 speed is PID controlled to hold the flow setpoint.
 // =====================================================================
 
 // ================= USER SETTINGS (edit here) =================
-// Flow setpoint (L/min), used in PROTEUS mode, and in SIM mode when auto is off
+// Flow setpoint (L/min)
 const float SETPOINT_LPM = 20.0;
 
 // PID gains
-const float KP_INIT = 2.0;    // PWM counts per (L/min) of error
-const float KI_INIT = 3.0;    // PWM counts per (L/min * s)
-const float KD_INIT = 0.0;    // PWM counts per (L/min / s)
-
-// Automatic setpoint steps (SIM mode only)
-const bool  AUTO_SETPOINT_ENABLED = true;
-const unsigned long AUTO_STEP_MS  = 10000UL;                  // time per step
-const float AUTO_SP[] = { 15.0, 30.0, 20.0, 40.0, 25.0 };     // L/min
-const byte  AUTO_N = 5;                                       // entries in AUTO_SP
-
-// ================= MODES =================
-const byte MODE_NONE    = 0;
-const byte MODE_SIM     = 1;
-const byte MODE_PROTEUS = 2;
-byte mode = MODE_NONE;
+const float KP = 2.0;    // PWM counts per (L/min) of error
+const float KI = 3.0;    // PWM counts per (L/min * s)
+const float KD = 0.0;    // PWM counts per (L/min / s)
 
 // ================= PINS =================
-const int PH_PIN       = A0;
-const int TURB_PIN     = A1;
-
 const int TRIG_PIN     = A2;
 const int ECHO_PIN     = A5;
 
 const int FLOW_PIN     = 2;
 
 // Pump 1 - L298 (fills the tank)
-const int PUMP1_EN     = 5;       // plain ON/OFF
+const int PUMP1_EN     = 5;       // PWM
 const int PUMP1_IN1    = 7;
 const int PUMP1_IN2    = 8;
 
@@ -58,25 +36,12 @@ const int PUMP2_EN     = 6;
 const int PUMP2_IN3    = 10;
 const int PUMP2_IN4    = 4;
 
-// Servo = 3-way diverter valve
+// Servo = valve
 const int SERVO_PIN    = 9;
 
-// ON/OFF switch (moved from D0 to D12 because D0/D1 are now the serial port)
+// ON/OFF switch (D0/D1 are the serial port, so the switch is on D12)
 const int SWITCH_PIN      = 12;
 const int SWITCH_ON_LEVEL = LOW;   // closed to ground = ON
-
-// ================= WATER QUALITY SETTINGS =================
-const float PH_MIN = 6.5;
-const float PH_MAX = 8.5;
-
-const int   PH_SAMPLES = 20;
-const float PH_ALPHA   = 0.2;
-float smoothedPH = -1.0;
-
-const int   TURB_SAMPLES = 20;
-const float TURB_ALPHA   = 0.2;
-const float TURBIDITY_MAX_NTU = 5.0;
-float smoothedNTU = -1.0;
 
 // ================= LEVEL SETTINGS =================
 const int LEVEL_START_PUMP1 = 30;
@@ -87,9 +52,9 @@ const int LEVEL_OVERFLOW    = 90;
 const float TANK_HEIGHT_CM = 400.0;
 
 // ================= PID / FLOW SETTINGS =================
-float Kp = KP_INIT;
-float Ki = KI_INIT;
-float Kd = KD_INIT;
+float Kp = KP;
+float Ki = KI;
+float Kd = KD;
 
 const float SP_MIN = 5.0;     // L/min
 const float SP_MAX = 45.0;    // L/min
@@ -104,53 +69,24 @@ const float FF_MAX_LPM = 60.0;
 const float MIN_FLOW = 10.0;                 // low-flow alarm threshold (L/min)
 const unsigned long FLOW_ALARM_MS = 4000;    // pump saturated + flow low for this long
 
-// Integral part accumulator 
 float pidI = 0.0;
-// Previous measured flow rate -> for derivative part
 float pidPrevMeas = 0.0;
-// Filter the derivative part to eliminate noise 
 float pidDFilt = 0.0;
 int   pump2Pwm = 0;
 
-// Diverter valve positions
+// Valve positions
 const int VALVE_CLOSED = 0;
 const int VALVE_OPEN   = 90;
-const int VALVE_WASTE  = 180;
-
-// ================= BAD WATER FLUSH SETTINGS =================
-const unsigned long BAD_WATER_DELAY_MS = 3000;
-const int  FLUSH_END_LEVEL = 10;
-const int  MAX_FLUSHES     = 3;
-
-// ================= SIMULATION SETTINGS =================
-float simLevel = 20.0;                    // tank level (%)
-const float SIM_FILL_PER_S      = 4.0;    // % per second while pump 1 runs
-const float SIM_TANK_CAPACITY_L = 100.0;  // virtual tank volume (L)
-unsigned long lastSimMillis = 0;
-
-// Simulated pump-2 / pipe model (first-order lag)
-const float SIM_PUMP_MAX_LPM = 60.0;      // flow at full PWM, full tank
-const float SIM_PUMP_TAU_S   = 1.0;       // time constant
-float simFlow = 0.0;                      // true simulated flow (L/min)
-unsigned long lastPlantMillis = 0; // Time of the last update 
-
-// Automatic setpoint state (SIM mode)
-bool autoSetpoint = AUTO_SETPOINT_ENABLED;
-byte autoIdx = 0;
-// Time of changing the setpoint => use it for the 10 second auto change
-unsigned long lastAutoStep = 0;
 
 // ================= FLOW SENSOR =================
 const float PULSES_PER_LITRE = 450.0;
-const unsigned long FLOW_WINDOW_SIM_MS     = 100;
-const unsigned long FLOW_WINDOW_PROTEUS_MS = 250;
-const float FLOW_ALPHA_SIM     = 0.6;
-const float FLOW_ALPHA_PROTEUS = 0.5;
+const unsigned long FLOW_WINDOW_MS = 250;
+const float FLOW_ALPHA = 0.5;
 
 volatile unsigned long pulseCount = 0;
 
 float flowLpm = 0.0;
-float flowDt  = 0.1;                      // seconds between flow samples
+float flowDt  = 0.25;                     // seconds between flow samples
 unsigned long lastFlowMillis = 0;
 
 // ================= ULTRASONIC =================
@@ -170,59 +106,16 @@ bool flowTimerStarted = false;
 bool flowAlarmLatched = false;
 unsigned long lowFlowStart = 0;
 
-bool flushing = false;
-bool sourceAlarm = false;
-bool badTimerStarted = false;
-unsigned long badStart = 0;
-int flushCount = 0;
-
 int valveAngle = VALVE_CLOSED;
 
 bool previousSwitchOn = false;
 
 unsigned long lastButtonCheck = 0;
 unsigned long lastPrint = 0;
-unsigned long lastMenuReminder = 0;
 
 // ================= FLOW INTERRUPT =================
 void pulseISR() {
   pulseCount++;
-}
-
-// ================= READ pH =================
-float readPH() {
-  long sum = 0;
-  for (int i = 0; i < PH_SAMPLES; i++) {
-    sum += analogRead(PH_PIN);
-    delayMicroseconds(500);
-  }
-  float averageRaw = sum / (float)PH_SAMPLES;
-  float rawPH = averageRaw * (14.0 / 1023.0);
-
-  if (smoothedPH < 0.0) smoothedPH = rawPH;
-  else smoothedPH = PH_ALPHA * rawPH + (1.0 - PH_ALPHA) * smoothedPH;
-
-  return constrain(smoothedPH, 0.0, 14.0);
-}
-
-// ================= READ TURBIDITY IN NTU =================
-float readTurbidityNTU() {
-  long sum = 0;
-  for (int i = 0; i < TURB_SAMPLES; i++) {
-    sum += analogRead(TURB_PIN);
-    delayMicroseconds(500);
-  }
-  float averageRaw = sum / (float)TURB_SAMPLES;
-  float voltage = averageRaw * (5.0 / 1023.0);
-
-  // 4 V = 0 NTU, 1 V = 4000 NTU
-  float rawNTU = (4.0 - voltage) * (4000.0 / 3.0);
-  rawNTU = constrain(rawNTU, 0.0, 4000.0);
-
-  if (smoothedNTU < 0.0) smoothedNTU = rawNTU;
-  else smoothedNTU = TURB_ALPHA * rawNTU + (1.0 - TURB_ALPHA) * smoothedNTU;
-
-  return smoothedNTU;
 }
 
 // ================= ULTRASONIC DISTANCE =================
@@ -238,27 +131,8 @@ float readDistanceCm() {
   return duration * 0.0343 / 2.0;
 }
 
-// ================= TANK SIMULATION =================
-void updateSimTank() {
-  unsigned long now = millis();
-  float dt = (now - lastSimMillis) / 1000.0;
-  lastSimMillis = now;
-
-  if (pump1Running) simLevel += SIM_FILL_PER_S * dt;
-  // Drain follows the measured flow (L/min -> L/s) as % of tank capacity
-  if (pump2Running) simLevel -= (flowLpm / 60.0) * dt / SIM_TANK_CAPACITY_L * 100.0;
-
-  simLevel = constrain(simLevel, 0.0, 100.0);
-}
-
 // ================= WATER LEVEL =================
-// SIM mode: simulated level.  PROTEUS mode: HC-SR04 (adjust distance in Proteus)
 int readLevel() {
-  if (mode == MODE_SIM) {
-    levelSensorValid = true;
-    return (int)(simLevel + 0.5); // ceiling
-  }
-
   unsigned long now = millis();
   if (now - lastLevelMillis >= 200 || lastLevelMillis == 0) {
     lastLevelMillis = now;
@@ -276,61 +150,27 @@ int readLevel() {
   return constrain((int)(pct + 0.5), 0, 100);
 }
 
-// ================= SIMULATED PUMP-2 PLANT =================
-void updateSimPlant(float dt) {
-  float target = 0.0;
-
-  if (pump2Running && valveAngle != VALVE_CLOSED) {
-    float drive = (pump2Pwm - PUMP2_PWM_MIN) / (float)(255 - PUMP2_PWM_MIN);
-    drive = constrain(drive, 0.0, 1.0);
-    float head = 0.85 + 0.15 * (simLevel / 100.0);   // less head when tank is low
-    target = drive * SIM_PUMP_MAX_LPM * head;
-  }
-
-  simFlow += (target - simFlow) * constrain(dt / SIM_PUMP_TAU_S, 0.0, 1.0);
-}
-
 // ================= UPDATE FLOW =================
 // Returns true when a new flow sample is ready (PID runs on that tick)
 bool updateFlow() {
   unsigned long now = millis();
-
-  if (mode == MODE_SIM) {
-    float pdt = (now - lastPlantMillis) / 1000.0;
-    lastPlantMillis = now;
-    updateSimPlant(pdt);
-  }
-
-  unsigned long window = (mode == MODE_SIM) ? FLOW_WINDOW_SIM_MS : FLOW_WINDOW_PROTEUS_MS;
   unsigned long elapsed = now - lastFlowMillis;
-  if (elapsed < window) return false;
+  if (elapsed < FLOW_WINDOW_MS) return false;
 
   lastFlowMillis = now;
   flowDt = elapsed / 1000.0;
 
-  float raw;
-  float alpha;
+  noInterrupts();
+  unsigned long count = pulseCount;
+  pulseCount = 0;
+  interrupts();
 
-  if (mode == MODE_SIM) {
-    float noise = (simFlow > 0.5) ? (random(-20, 21) / 100.0) : 0.0;   // +-0.2 L/min
-    raw = simFlow + noise;
-    alpha = FLOW_ALPHA_SIM;
-  } else {
-    noInterrupts();
-    unsigned long count = pulseCount;
-    pulseCount = 0;
-    interrupts();
-    raw = (count * 60000.0) / (PULSES_PER_LITRE * elapsed);
-    alpha = FLOW_ALPHA_PROTEUS;
-  }
-
-  if (raw < 0.0) raw = 0.0;
-  flowLpm = alpha * raw + (1.0 - alpha) * flowLpm;
+  float raw = (count * 60000.0) / (PULSES_PER_LITRE * elapsed);
+  flowLpm = FLOW_ALPHA * raw + (1.0 - FLOW_ALPHA) * flowLpm;
   return true;
 }
 
 // ================= PID =================
-// Estimates Initial PWM value from the desired flow rate 
 float feedForwardPwm() {
   float ff = PUMP2_PWM_MIN + (setpoint / FF_MAX_LPM) * (PUMP2_PWM_MAX - PUMP2_PWM_MIN);
   return constrain(ff, PUMP2_PWM_MIN, PUMP2_PWM_MAX);
@@ -349,7 +189,7 @@ int pidCompute(float sp, float meas, float dt) {
   float e = sp - meas;
   float P = Kp * e;
 
-  // derivative on measurement (no kick on setpoint steps), low-pass filtered
+  // derivative on measurement (no kick on setpoint changes), low-pass filtered
   float dRaw = -(meas - pidPrevMeas) / dt;
   pidPrevMeas = meas;
   pidDFilt = 0.7 * pidDFilt + 0.3 * dRaw;
@@ -375,7 +215,7 @@ void setValve(int angle) {
 
 // ================= PUMP CONTROL =================
 void stopPump1() {
-  digitalWrite(PUMP1_EN, 0);
+  analogWrite(PUMP1_EN, 0);
   digitalWrite(PUMP1_IN1, LOW);
   digitalWrite(PUMP1_IN2, LOW);
   pump1Running = false;
@@ -384,7 +224,7 @@ void stopPump1() {
 void startPump1() {
   digitalWrite(PUMP1_IN1, HIGH);
   digitalWrite(PUMP1_IN2, LOW);
-  digitalWrite(PUMP1_EN, 255);
+  analogWrite(PUMP1_EN, 200);
   pump1Running = true;
 }
 
@@ -402,32 +242,12 @@ void startPump2() {
   pump2Running = true;
 }
 
-// ================= RESET ALARMS / FLUSH STATE =================
-void resetStates() {
-  flowTimerStarted = false;
-  flowAlarmLatched = false;
-
-  flushing = false;
-  sourceAlarm = false;
-  badTimerStarted = false;
-  flushCount = 0;
-}
-
 // ================= START / STOP SYSTEM =================
 void startSystem() {
-  if (mode == MODE_NONE) {
-    Serial.println(F("[!] Select a mode first: 1 = SIM, 2 = PROTEUS"));
-    return;
-  }
   systemRunning = true;
-  resetStates();
+  flowTimerStarted = false;
+  flowAlarmLatched = false;
   pidReset();
-
-  if (mode == MODE_SIM && autoSetpoint) {
-    autoIdx = 0;
-    setpoint = AUTO_SP[0];
-    lastAutoStep = millis();
-  }
   Serial.println(F("[SYSTEM] STARTED"));
 }
 
@@ -439,89 +259,21 @@ void stopSystem() {
   pump2Pwm = 0;
 
   setValve(VALVE_CLOSED);
-  resetStates();
-}
-
-// ================= MODE SELECTION =================
-void selectMode(byte m) {
-  stopSystem();
-  mode = m;
-
-  simLevel = 20.0;
-  simFlow = 0.0;
-  flowLpm = 0.0;
-  pidI = 0.0;
-
-  noInterrupts();
-  pulseCount = 0;
-  interrupts();
-
-  unsigned long now = millis();
-  lastFlowMillis = now;
-  lastPlantMillis = now;
-  lastSimMillis = now;
-
-  lastLevelMillis = 0;         // force a fresh ultrasonic reading
-  levelSensorValid = true;
-  setpoint = SETPOINT_LPM;
-  autoSetpoint = (m == MODE_SIM) && AUTO_SETPOINT_ENABLED;
-  previousSwitchOn = false;    // if the switch is already ON it starts the system
-
-  if (m == MODE_SIM) {
-    Serial.println(F("[MODE] SIMULATION: level + flow simulated"));
-  } else {
-    Serial.println(F("[MODE] PROTEUS: level = HC-SR04, flow = sensor pulses on D2"));
-  }
-  Serial.println(F("Turn the switch ON to start."));
+  flowTimerStarted = false;
+  flowAlarmLatched = false;
 }
 
 // ================= TERMINAL OUTPUT =================
-void printMenu() {
-  Serial.println();
-  Serial.println(F("=== WATER TREATMENT STATION ==="));
-  Serial.println(F("Select mode (press key):"));
-  Serial.println(F("  1 = SIMULATION"));
-  Serial.println(F("  2 = PROTEUS"));
-}
-
-// Only the mode keys are accepted from the terminal
-void handleSerial() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '1') selectMode(MODE_SIM);
-    else if (c == '2') selectMode(MODE_PROTEUS);
-  }
-}
-
-// ================= AUTO SETPOINT (SIM MODE) =================
-void updateAutoSetpoint() {
-  if (mode != MODE_SIM || !autoSetpoint || !systemRunning) return;
-
-  if (millis() - lastAutoStep >= AUTO_STEP_MS) {
-    lastAutoStep = millis();
-    autoIdx = (autoIdx + 1) % AUTO_N;
-    setpoint = AUTO_SP[autoIdx];
-
-    Serial.print(F("[AUTO] setpoint -> "));
-    Serial.print(setpoint, 1);
-    Serial.println(F(" L/min"));
-  }
-}
-
-// ================= STATE CHANGE MESSAGES =================
-void printStateChange(bool qualityAlarm, bool overflow) {
+void printStateChange(bool overflow) {
   static int lastKey = -1;
   byte status;
   byte bits = 0;
 
-  if (!systemRunning)        status = 0;
-  else if (sourceAlarm)      status = 4;
-  else if (flushing)         status = 3;
-  else if (qualityAlarm || overflow || flowAlarmLatched) {
+  if (!systemRunning) status = 0;
+  else if (overflow || flowAlarmLatched) {
     status = 2;
-    if (qualityAlarm)     bits |= 1;
-    if (overflow)         bits |= 2;
-    if (flowAlarmLatched) bits |= 4;
+    if (overflow)         bits |= 1;
+    if (flowAlarmLatched) bits |= 2;
   }
   else status = 1;
 
@@ -535,28 +287,20 @@ void printStateChange(bool qualityAlarm, bool overflow) {
     case 1: Serial.println(F("RUNNING - NORMAL")); break;
     case 2:
       Serial.print(F("RUNNING - ALARM:"));
-      if (bits & 1) Serial.print(F(" pH/turbidity"));
-      if (bits & 2) Serial.print(F(" overflow/level"));
-      if (bits & 4) Serial.print(F(" LOW FLOW(pump2 off, toggle switch to reset)"));
+      if (bits & 1) Serial.print(F(" overflow/level sensor"));
+      if (bits & 2) Serial.print(F(" LOW FLOW (pump2 off, toggle switch to reset)"));
       Serial.println();
       break;
-    case 3: Serial.println(F("FLUSHING BAD WATER")); break;
-    case 4: Serial.println(F("ALARM: SOURCE BAD (toggle switch to reset)")); break;
   }
 }
 
-void printStatusLine(float ph, float ntu, int level) {
-  Serial.print(mode == MODE_SIM ? F("SIM ") : F("PRO "));
+void printStatusLine(int level) {
   Serial.print(F("SP:"));
   Serial.print(systemRunning ? setpoint : 0.0, 1);
   Serial.print(F(" F:"));
   Serial.print(flowLpm, 1);
   Serial.print(F(" PWM:"));
   Serial.print(pump2Running ? pump2Pwm : 0);
-  Serial.print(F(" pH:"));
-  Serial.print(ph, 1);
-  Serial.print(F(" T:"));
-  Serial.print(ntu, 0);
   Serial.print(F(" L:"));
   if (levelSensorValid) {
     Serial.print(level);
@@ -569,9 +313,7 @@ void printStatusLine(float ph, float ntu, int level) {
   Serial.print(F(" P2:"));
   Serial.print(pump2Running ? F("ON") : F("OFF"));
   Serial.print(F(" V:"));
-  if (valveAngle == VALVE_OPEN)       Serial.println(F("OUT"));
-  else if (valveAngle == VALVE_WASTE) Serial.println(F("WST"));
-  else                                Serial.println(F("OFF"));
+  Serial.println(valveAngle == VALVE_OPEN ? F("OPEN") : F("CLOSED"));
 }
 
 // ================= SETUP =================
@@ -596,30 +338,23 @@ void setup() {
   valveServo.attach(SERVO_PIN);
 
   Serial.begin(9600);
-  randomSeed(analogRead(A3));
 
   stopPump1();
   stopPump2();
   setValve(VALVE_CLOSED);
 
   delay(500);
-  printMenu();
-  lastMenuReminder = millis();
+  Serial.println(F("=== WATER STATION - PID FLOW CONTROL ==="));
+  Serial.println(F("Turn the switch ON to start."));
+
+  lastFlowMillis = millis();
+  noInterrupts();
+  pulseCount = 0;          // drop pulses counted during startup
+  interrupts();
 }
 
 // ================= MAIN LOOP =================
 void loop() {
-
-  handleSerial();
-
-  // ---------- WAIT FOR MODE SELECTION ----------
-  if (mode == MODE_NONE) {
-    if (millis() - lastMenuReminder >= 8000) {
-      lastMenuReminder = millis();
-      printMenu();
-    }
-    return;
-  }
 
   // ---------- ON / OFF SWITCH ----------
   if (millis() - lastButtonCheck >= 30) {
@@ -637,88 +372,35 @@ void loop() {
     previousSwitchOn = switchOn;
   }
 
-  // ---------- SIMULATED TANK ----------
-  if (mode == MODE_SIM) updateSimTank();
-
-  // ---------- AUTO SETPOINT ----------
-  updateAutoSetpoint();
-
   // ---------- READ SENSORS ----------
-  float ph = readPH();
-  float turbidityNTU = readTurbidityNTU();
   int level = readLevel();
 
   bool newSample = updateFlow();
   float flow = flowLpm;
 
-  // ---------- WATER QUALITY ----------
-  bool phGood = (ph >= PH_MIN && ph <= PH_MAX);
-  bool turbidityGood = (turbidityNTU <= TURBIDITY_MAX_NTU);
-  bool waterQualityGood = phGood && turbidityGood;
-
   bool overflow = (!levelSensorValid || level >= LEVEL_OVERFLOW);
-  bool qualityAlarm = !waterQualityGood;
 
   // ---------- SYSTEM CONTROL ----------
   if (systemRunning) {
 
-    // ----- Bad water detection (debounced) -----
-    if (!waterQualityGood && !flushing && !sourceAlarm) {
-
-      if (!badTimerStarted) {
-        badStart = millis();
-        badTimerStarted = true;
-      }
-
-      if (millis() - badStart >= BAD_WATER_DELAY_MS && level > FLUSH_END_LEVEL) {
-        badTimerStarted = false;
-
-        if (flushCount >= MAX_FLUSHES) {
-          sourceAlarm = true;
-        } else {
-          flushing = true;
-          flushCount++;
-        }
-      }
-    } else {
-      badTimerStarted = false;
-    }
-
-    // ----- End of flush -----
-    if (flushing && level <= FLUSH_END_LEVEL) {
-      flushing = false;
-    }
-
-    // ----- Tank full of good water: forget previous flushes -----
-    if (waterQualityGood && level >= LEVEL_STOP_PUMP1) {
-      flushCount = 0;
-    }
-
-    // ----- Pump 1: level hysteresis -----
+    // ----- Pump 1: fill tank using level hysteresis -----
     if (level <= LEVEL_START_PUMP1) {
       pump1Running = true;
     } else if (level >= LEVEL_STOP_PUMP1) {
       pump1Running = false;
     }
 
-    if (overflow || flushing || sourceAlarm) {
+    if (overflow) {
       pump1Running = false;
     }
 
     if (pump1Running) startPump1();
     else stopPump1();
 
-    // ----- Pump 2: output good water OR flush bad water -----
-    bool pump2Allowed;
-
-    if (sourceAlarm) {
-      pump2Allowed = false;
-    } else if (flushing) {
-      pump2Allowed = !flowAlarmLatched;
-    } else {
-      pump2Allowed = waterQualityGood && !overflow &&
-                     level > LEVEL_MIN_PUMP2 && !flowAlarmLatched;
-    }
+    // ----- Pump 2: empties the tank at the PID flow setpoint -----
+    bool pump2Allowed = !overflow &&
+                        level > LEVEL_MIN_PUMP2 &&
+                        !flowAlarmLatched;
 
     if (pump2Allowed) {
 
@@ -757,10 +439,8 @@ void loop() {
       flowTimerStarted = false;
     }
 
-    // ----- Diverter valve -----
-    if (!pump2Allowed)  setValve(VALVE_CLOSED);
-    else if (flushing)  setValve(VALVE_WASTE);
-    else                setValve(VALVE_OPEN);
+    // ----- Valve -----
+    setValve(pump2Allowed ? VALVE_OPEN : VALVE_CLOSED);
 
   } else {
 
@@ -771,10 +451,10 @@ void loop() {
   }
 
   // ---------- TERMINAL ----------
-  printStateChange(qualityAlarm, overflow);
+  printStateChange(overflow);
 
   if (millis() - lastPrint >= 1000) {
     lastPrint = millis();
-    printStatusLine(ph, turbidityNTU, level);
+    printStatusLine(level);
   }
 }
