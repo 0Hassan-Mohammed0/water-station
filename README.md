@@ -208,7 +208,7 @@ Before opening the project, install the custom sensor and Arduino libraries loca
 3. Close the **START** switch (to ground). The terminal prints `[SYSTEM] STARTED`.
 4. In **PROTEUS** mode, set the flow sensor to a value **above 10 L/min** *before* the pump runs at full PWM, otherwise the low-flow alarm will trigger after 4 seconds.
 
-![Proteus schematic](docs/images/proteus-schematic.png)
+![Proteus schematic](docs/images/proteus-schematic_v2.png)
 
 ---
 
