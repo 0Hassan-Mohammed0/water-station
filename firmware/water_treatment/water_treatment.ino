@@ -49,14 +49,14 @@ const int ECHO_PIN     = A5;
 const int FLOW_PIN     = 2;
 
 // Pump 1 - L298 (fills the tank)
-const int PUMP1_EN     = 4;       // plain ON/OFF
+const int PUMP1_EN     = 5;       // plain ON/OFF
 const int PUMP1_IN1    = 7;
 const int PUMP1_IN2    = 8;
 
 // Pump 2 - L298 (empties the tank) - speed is PID controlled
 const int PUMP2_EN     = 6;
 const int PUMP2_IN3    = 10;
-const int PUMP2_IN4    = A4;
+const int PUMP2_IN4    = 4;
 
 // Servo = 3-way diverter valve
 const int SERVO_PIN    = 9;
@@ -104,8 +104,11 @@ const float FF_MAX_LPM = 60.0;
 const float MIN_FLOW = 10.0;                 // low-flow alarm threshold (L/min)
 const unsigned long FLOW_ALARM_MS = 4000;    // pump saturated + flow low for this long
 
+// Integral part accumulator 
 float pidI = 0.0;
+// Previous measured flow rate -> for derivative part
 float pidPrevMeas = 0.0;
+// Filter the derivative part to eliminate noise 
 float pidDFilt = 0.0;
 int   pump2Pwm = 0;
 
@@ -129,11 +132,12 @@ unsigned long lastSimMillis = 0;
 const float SIM_PUMP_MAX_LPM = 60.0;      // flow at full PWM, full tank
 const float SIM_PUMP_TAU_S   = 1.0;       // time constant
 float simFlow = 0.0;                      // true simulated flow (L/min)
-unsigned long lastPlantMillis = 0;
+unsigned long lastPlantMillis = 0; // Time of the last update 
 
 // Automatic setpoint state (SIM mode)
 bool autoSetpoint = AUTO_SETPOINT_ENABLED;
 byte autoIdx = 0;
+// Time of changing the setpoint => use it for the 10 second auto change
 unsigned long lastAutoStep = 0;
 
 // ================= FLOW SENSOR =================
@@ -252,7 +256,7 @@ void updateSimTank() {
 int readLevel() {
   if (mode == MODE_SIM) {
     levelSensorValid = true;
-    return (int)(simLevel + 0.5);
+    return (int)(simLevel + 0.5); // ceiling
   }
 
   unsigned long now = millis();
@@ -326,6 +330,7 @@ bool updateFlow() {
 }
 
 // ================= PID =================
+// Estimates Initial PWM value from the desired flow rate 
 float feedForwardPwm() {
   float ff = PUMP2_PWM_MIN + (setpoint / FF_MAX_LPM) * (PUMP2_PWM_MAX - PUMP2_PWM_MIN);
   return constrain(ff, PUMP2_PWM_MIN, PUMP2_PWM_MAX);
@@ -370,7 +375,7 @@ void setValve(int angle) {
 
 // ================= PUMP CONTROL =================
 void stopPump1() {
-  digitalWrite(PUMP1_EN, LOW);
+  digitalWrite(PUMP1_EN, 0);
   digitalWrite(PUMP1_IN1, LOW);
   digitalWrite(PUMP1_IN2, LOW);
   pump1Running = false;
@@ -379,7 +384,7 @@ void stopPump1() {
 void startPump1() {
   digitalWrite(PUMP1_IN1, HIGH);
   digitalWrite(PUMP1_IN2, LOW);
-  digitalWrite(PUMP1_EN, HIGH);
+  digitalWrite(PUMP1_EN, 255);
   pump1Running = true;
 }
 
